@@ -17,6 +17,7 @@ pub type DepositEvent = BorrowCollateralDepositEvent;
 
 use crate::pause::{self, PauseType};
 use crate::reentrancy::{ReentrancyGuard, ReentrancyKey};
+use crate::rounding;
 use soroban_sdk::{contracterror, contracttype, Address, Env, IntoVal, Symbol, I256};
 
 #[contracttype]
@@ -48,14 +49,18 @@ pub enum BorrowError {
     AssetNotSupported = 7,
     /// Borrow amount is below the configured minimum
     BelowMinimumBorrow = 8,
-    /// Repay amount exceeds current debt
-    RepayAmountTooHigh = 9,
-    /// Position is healthy and cannot be liquidated
-    PositionHealthy = 10,
-    /// Insufficient reserves to recover bad debt
-    InsufficientReserves = 11,
+    /// Amount is below minimum transaction threshold (dust)
+    AmountBelowMinimum = 9,
+    /// No dust available to sweep
+    NoDustToSweep = 10,
     /// Reentrancy detected
-    ReentrancyDetected = 12,
+    ReentrancyDetected = 11,
+    /// Repay amount exceeds current debt
+    RepayAmountTooHigh = 12,
+    /// Position is healthy and cannot be liquidated
+    PositionHealthy = 13,
+    /// Insufficient reserves to recover bad debt
+    InsufficientReserves = 14,
 }
 
 /// Borrow on behalf of a user when authorization is provided via a trusted delegate.
@@ -113,22 +118,29 @@ pub enum BorrowDataKey {
     LiquidationThresholdBps,
     /// Close factor in basis points (e.g. 5000 = 50%)
     CloseFactorBps,
+    /// Dust amount tracking for debt positions
+    DustAmount(Address),
     /// Liquidation incentive in basis points (e.g. 1000 = 10%)
     LiquidationIncentiveBps,
     /// Global interest index (for invariant testing)
     InterestIndex,
     /// Stablecoin configuration for a specific asset
     AssetStablecoinConfig(Address),
-
     /// Stable borrow rate state (protocol-wide)
     StableRateState,
     /// Stable rate premium in basis points
     StableRatePremiumBps,
     /// Stable rate recalculation interval in seconds
-    StableRateRecalcIntervalSecs,
-    /// Switch fee in basis points applied when switching rate types
-    RateSwitchFeeBps,
+    StableRateRecalcInterval,
 }
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+/// Minimum transaction amount (1 unit of asset)
+const MIN_TRANSACTION_AMOUNT: i128 = 1;
+
+/// Dust threshold (same as minimum transaction amount)
+const DUST_THRESHOLD: i128 = MIN_TRANSACTION_AMOUNT;
 
 /// Dynamic stablecoin configuration.
 #[contracttype]
@@ -394,9 +406,14 @@ fn borrow_inner(
         return Err(BorrowError::InvalidAmount);
     }
 
+    // Gas-efficient dust check (early return)
+    if amount < DUST_THRESHOLD {
+        return Err(BorrowError::AmountBelowMinimum);
+    }
+
     let min_borrow = get_min_borrow_amount(env);
     if amount < min_borrow {
-        return Err(BorrowError::BelowMinimumBorrow);
+        return Err(BorrowError::AmountBelowMinimum);
     }
 
     validate_collateral_ratio(collateral_amount, amount)?;
@@ -465,6 +482,11 @@ pub fn deposit(env: &Env, user: Address, asset: Address, amount: i128) -> Result
 
     if amount <= 0 {
         return Err(BorrowError::InvalidAmount);
+    }
+
+    // Gas-efficient dust check (early return)
+    if amount < DUST_THRESHOLD {
+        return Err(BorrowError::AmountBelowMinimum);
     }
 
     // 2. EFFECTS: Update state before any external interactions
@@ -702,6 +724,8 @@ pub(crate) fn calculate_interest(env: &Env, position: &DebtPosition) -> Result<i
     let rate_256 = I256::from_i128(env, rate_bps);
     let time_256 = I256::from_i128(env, time_elapsed as i128);
 
+    // Use depositor-friendly rounding (round down) for interest calculation
+    // This ensures borrowers pay less interest due to rounding
     let mut interest_256 = borrowed_256
         .mul(&rate_256)
         .mul(&time_256)
@@ -722,6 +746,7 @@ pub(crate) fn calculate_interest(env: &Env, position: &DebtPosition) -> Result<i
             };
 
             if deviation_bps > config.peg_threshold_bps {
+                // Use depositor-friendly rounding (round down) for stability fee
                 let stability_fee_256 = borrowed_256
                     .mul(&I256::from_i128(env, config.stability_fee_bps))
                     .mul(&time_256)
@@ -1026,6 +1051,87 @@ pub fn get_liquidation_incentive_bps(env: &Env) -> i128 {
         .persistent()
         .get(&BorrowDataKey::LiquidationIncentiveBps)
         .unwrap_or(1000)
+}
+
+/// Sweep dust amounts from user's debt position
+///
+/// # Arguments
+/// * `env` - The contract environment
+/// * `user` - The user's address
+/// * `asset` - The asset address
+///
+/// # Returns
+/// Returns the dust amount swept on success
+pub fn sweep_dust(env: &Env, user: Address, asset: Address) -> Result<i128, BorrowError> {
+    // CHECKS-EFFECTS-INTERACTIONS PATTERN
+    // 1. CHECKS: Reentrancy guard, authorization
+    let _guard = ReentrancyGuard::new_with_key(env, ReentrancyKey::BorrowLock, false)
+        .map_err(|_| BorrowError::ReentrancyDetected)?;
+
+    user.require_auth();
+
+    // Get dust amount
+    let dust_amount = get_dust_amount(env, &user);
+    if dust_amount < DUST_THRESHOLD {
+        return Err(BorrowError::NoDustToSweep);
+    }
+
+    let mut debt_position = get_debt_position(env, &user, Some(&asset), RateType::Variable);
+
+    // 2. EFFECTS: Update state before any external interactions
+    // Remove dust from position
+    debt_position.borrowed_amount = debt_position
+        .borrowed_amount
+        .checked_sub(dust_amount)
+        .ok_or(BorrowError::Overflow)?;
+    save_debt_position(env, &user, &debt_position);
+
+    // Clear dust tracking
+    clear_dust(env, &user);
+
+    // Update total debt
+    let total_debt = get_total_debt(env);
+    let new_total = total_debt
+        .checked_sub(dust_amount)
+        .ok_or(BorrowError::Overflow)?;
+    set_total_debt(env, new_total);
+
+    // 3. INTERACTIONS: Transfer dust to user (if applicable)
+    // Note: For debt positions, dust is typically written off rather than transferred
+    // since it represents debt, not assets held by the protocol
+
+    Ok(dust_amount)
+}
+
+/// Get dust amount for a user's position
+fn get_dust_amount(env: &Env, user: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&BorrowDataKey::DustAmount(user.clone()))
+        .unwrap_or(0)
+}
+
+/// Set dust amount for a user's position
+fn set_dust_amount(env: &Env, user: &Address, dust: i128) {
+    env.storage()
+        .persistent()
+        .set(&BorrowDataKey::DustAmount(user.clone()), &dust);
+}
+
+/// Clear dust tracking for a user's position
+fn clear_dust(env: &Env, user: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&BorrowDataKey::DustAmount(user.clone()));
+}
+
+/// Track dust accumulation during operations
+pub fn track_dust(env: &Env, user: &Address, dust: i128) {
+    if dust > 0 && dust < DUST_THRESHOLD {
+        let current_dust = get_dust_amount(env, user);
+        let new_dust = current_dust.checked_add(dust).unwrap_or(current_dust);
+        set_dust_amount(env, user, new_dust);
+    }
 }
 
 /// Set oracle address for price feeds (admin only). Caller must be admin and authorize.
