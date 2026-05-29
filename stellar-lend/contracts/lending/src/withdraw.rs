@@ -1,6 +1,7 @@
 use soroban_sdk::{contracterror, contracttype, Address, Env};
 
 use crate::deposit::{DepositCollateral, DepositDataKey};
+use crate::reentrancy::{ReentrancyGuard, ReentrancyKey};
 
 pub use crate::events::WithdrawEvent;
 
@@ -15,6 +16,7 @@ pub enum WithdrawError {
     InsufficientCollateral = 4,
     InsufficientCollateralRatio = 5,
     Unauthorized = 6,
+    ReentrancyDetected = 7,
 }
 
 /// Storage keys for withdraw-related data
@@ -54,6 +56,11 @@ pub(crate) fn withdraw_with_auth(
     amount: i128,
     require_auth: bool,
 ) -> Result<i128, WithdrawError> {
+    // CHECKS-EFFECTS-INTERACTIONS PATTERN
+    // 1. CHECKS: Reentrancy guard, authorization, pause state, validation
+    let _guard = ReentrancyGuard::new_with_key(env, ReentrancyKey::WithdrawLock, false)
+        .map_err(|_| WithdrawError::ReentrancyDetected)?;
+
     if require_auth {
         user.require_auth();
     }
@@ -84,6 +91,7 @@ pub(crate) fn withdraw_with_auth(
 
     validate_collateral_ratio_after_withdraw(env, &user, new_amount)?;
 
+    // 2. EFFECTS: Update state before any external interactions
     let updated_position = DepositCollateral {
         amount: new_amount,
         asset: asset.clone(),
@@ -96,6 +104,7 @@ pub(crate) fn withdraw_with_auth(
     let new_total = total_deposits.checked_sub(amount).unwrap_or(0);
     set_total_deposits(env, new_total);
 
+    // 3. INTERACTIONS: Emit events (no external calls in withdraw)
     WithdrawEvent {
         user,
         asset,
