@@ -8,6 +8,7 @@ mod flash_loan;
 mod pause;
 mod token_receiver;
 mod withdraw;
+mod reentrancy;
 
 use borrow::{
     borrow as borrow_cmd, deposit as borrow_deposit, get_admin as get_borrow_admin,
@@ -17,6 +18,7 @@ use borrow::{
     set_liquidation_threshold_bps as set_liquidation_threshold_logic,
     set_oracle as set_oracle_logic, BorrowCollateral, BorrowError, DebtPosition,
 };
+use reentrancy::{ReentrancyGuard, ReentrancyKey};
 use deposit::{
     deposit as deposit_logic, get_user_collateral as get_deposit_collateral,
     initialize_deposit_settings as initialize_deposit_logic, DepositCollateral, DepositError,
@@ -80,6 +82,8 @@ mod upgrade_test;
 mod views_test;
 #[cfg(test)]
 mod withdraw_test;
+#[cfg(test)]
+mod reentrancy_fuzz_test;
 
 #[contract]
 pub struct LendingContract;
@@ -93,11 +97,20 @@ impl LendingContract {
         debt_ceiling: i128,
         min_borrow_amount: i128,
     ) -> Result<(), BorrowError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard (constructor protection), validation
+        let _guard = ReentrancyGuard::new_constructor(&env)
+            .map_err(|_| BorrowError::ReentrancyDetected)?;
+
         if get_borrow_admin(&env).is_some() {
             return Err(BorrowError::Unauthorized);
         }
+
+        // 2. EFFECTS: Update state before any external interactions
         set_borrow_admin(&env, &admin);
         initialize_borrow_logic(&env, debt_ceiling, min_borrow_amount)?;
+
+        // 3. INTERACTIONS: No external calls
         Ok(())
     }
 
@@ -127,12 +140,21 @@ impl LendingContract {
         pause_type: PauseType,
         paused: bool,
     ) -> Result<(), BorrowError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard, authorization
+        let _guard = ReentrancyGuard::new_with_key(&env, ReentrancyKey::GlobalLock, false)
+            .map_err(|_| BorrowError::ReentrancyDetected)?;
+
         let current_admin = get_borrow_admin(&env).ok_or(BorrowError::Unauthorized)?;
         if admin != current_admin {
             return Err(BorrowError::Unauthorized);
         }
         admin.require_auth();
+
+        // 2. EFFECTS: Update state before any external interactions
         set_pause_logic(&env, admin, pause_type, paused);
+
+        // 3. INTERACTIONS: No external calls
         Ok(())
     }
 
@@ -181,11 +203,20 @@ impl LendingContract {
         _collateral_asset: Address,
         _amount: i128,
     ) -> Result<(), BorrowError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard, authorization, pause state
+        let _guard = ReentrancyGuard::new_with_key(&env, ReentrancyKey::LiquidateLock, false)
+            .map_err(|_| BorrowError::ReentrancyDetected)?;
+
         liquidator.require_auth();
         if is_paused(&env, PauseType::Liquidation) {
             return Err(BorrowError::ProtocolPaused);
         }
+
+        // 2. EFFECTS: Update state before any external interactions
         // Stub implementation, or call borrow::liquidate if it exists
+
+        // 3. INTERACTIONS: No external calls in stub
         Ok(())
     }
 
@@ -205,36 +236,53 @@ impl LendingContract {
 
     /// Returns the user's collateral balance (raw amount).
     pub fn get_collateral_balance(env: Env, user: Address) -> i128 {
+        // READ-ONLY REENTRANCY DETECTION
+        let _guard = ReentrancyGuard::new_read_only(&env);
         view_collateral_balance(&env, &user)
     }
 
     /// Returns the user's debt balance (principal + accrued interest).
     pub fn get_debt_balance(env: Env, user: Address) -> i128 {
+        // READ-ONLY REENTRANCY DETECTION
+        let _guard = ReentrancyGuard::new_read_only(&env);
         view_debt_balance(&env, &user)
     }
 
     /// Returns the user's collateral value in common unit (e.g. USD 8 decimals). 0 if oracle not set.
     pub fn get_collateral_value(env: Env, user: Address) -> i128 {
+        // READ-ONLY REENTRANCY DETECTION
+        let _guard = ReentrancyGuard::new_read_only(&env);
         view_collateral_value(&env, &user)
     }
 
     /// Returns the user's debt value in common unit. 0 if oracle not set.
     pub fn get_debt_value(env: Env, user: Address) -> i128 {
+        // READ-ONLY REENTRANCY DETECTION
+        let _guard = ReentrancyGuard::new_read_only(&env);
         view_debt_value(&env, &user)
     }
 
     /// Returns health factor (scaled 10000 = 1.0). Above 10000 = healthy; below = liquidatable.
     pub fn get_health_factor(env: Env, user: Address) -> i128 {
+        // READ-ONLY REENTRANCY DETECTION
+        let _guard = ReentrancyGuard::new_read_only(&env);
         view_health_factor(&env, &user)
     }
 
     /// Returns full position summary: collateral/debt balances and values, and health factor.
     pub fn get_user_position(env: Env, user: Address) -> UserPositionSummary {
+        // READ-ONLY REENTRANCY DETECTION
+        let _guard = ReentrancyGuard::new_read_only(&env);
         view_user_position(&env, &user)
     }
 
     /// Set oracle address for price feeds (admin only).
     pub fn set_oracle(env: Env, admin: Address, oracle: Address) -> Result<(), BorrowError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard
+        let _guard = ReentrancyGuard::new_with_key(&env, ReentrancyKey::GlobalLock, false)
+            .map_err(|_| BorrowError::ReentrancyDetected)?;
+
         set_oracle_logic(&env, &admin, oracle)
     }
 
@@ -244,6 +292,11 @@ impl LendingContract {
         admin: Address,
         bps: i128,
     ) -> Result<(), BorrowError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard
+        let _guard = ReentrancyGuard::new_with_key(&env, ReentrancyKey::GlobalLock, false)
+            .map_err(|_| BorrowError::ReentrancyDetected)?;
+
         set_liquidation_threshold_logic(&env, &admin, bps)
     }
 
@@ -253,12 +306,22 @@ impl LendingContract {
         deposit_cap: i128,
         min_deposit_amount: i128,
     ) -> Result<(), DepositError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard
+        let _guard = ReentrancyGuard::new_with_key(&env, ReentrancyKey::GlobalLock, false)
+            .map_err(|_| DepositError::ReentrancyDetected)?;
+
         initialize_deposit_logic(&env, deposit_cap, min_deposit_amount)
     }
 
     /// Set deposit pause state (admin only)
     /// Deprecated: use set_pause instead
     pub fn set_deposit_paused(env: Env, paused: bool) -> Result<(), DepositError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard
+        let _guard = ReentrancyGuard::new_with_key(&env, ReentrancyKey::GlobalLock, false)
+            .map_err(|_| DepositError::ReentrancyDetected)?;
+
         env.storage()
             .persistent()
             .set(&pause::PauseDataKey::State(PauseType::Deposit), &paused);
@@ -306,19 +369,37 @@ impl LendingContract {
         admin: Address,
         config: FlashManipulationConfig,
     ) -> Result<(), FlashLoanError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard, authorization
+        let _guard = ReentrancyGuard::new_with_key(&env, ReentrancyKey::GlobalLock, false)
+            .map_err(|_| FlashLoanError::Reentrancy)?;
+
         let current_admin = get_borrow_admin(&env).ok_or(FlashLoanError::Unauthorized)?;
         if admin != current_admin {
             return Err(FlashLoanError::Unauthorized);
         }
         admin.require_auth();
+
+        // 2. EFFECTS: Update state before any external interactions
         set_flash_manipulation_config(&env, config)
+
+        // 3. INTERACTIONS: No external calls
     }
 
     /// Set the flash loan fee in basis points (admin only)
     pub fn set_flash_loan_fee_bps(env: Env, fee_bps: i128) -> Result<(), FlashLoanError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard, authorization
+        let _guard = ReentrancyGuard::new_with_key(&env, ReentrancyKey::GlobalLock, false)
+            .map_err(|_| FlashLoanError::Reentrancy)?;
+
         let current_admin = get_borrow_admin(&env).ok_or(FlashLoanError::Unauthorized)?;
         current_admin.require_auth();
+
+        // 2. EFFECTS: Update state before any external interactions
         set_flash_loan_fee_logic(&env, fee_bps)
+
+        // 3. INTERACTIONS: No external calls
     }
 
     /// Withdraw collateral from the protocol
@@ -339,11 +420,21 @@ impl LendingContract {
         env: Env,
         min_withdraw_amount: i128,
     ) -> Result<(), WithdrawError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard
+        let _guard = ReentrancyGuard::new_with_key(&env, ReentrancyKey::GlobalLock, false)
+            .map_err(|_| WithdrawError::ReentrancyDetected)?;
+
         initialize_withdraw_logic(&env, min_withdraw_amount)
     }
 
     /// Set withdraw pause state (admin only)
     pub fn set_withdraw_paused(env: Env, paused: bool) -> Result<(), WithdrawError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard
+        let _guard = ReentrancyGuard::new_with_key(&env, ReentrancyKey::GlobalLock, false)
+            .map_err(|_| WithdrawError::ReentrancyDetected)?;
+
         set_withdraw_paused_logic(&env, paused)
     }
 
@@ -364,6 +455,11 @@ impl LendingContract {
         debt_ceiling: i128,
         min_borrow_amount: i128,
     ) -> Result<(), BorrowError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard
+        let _guard = ReentrancyGuard::new_with_key(&env, ReentrancyKey::GlobalLock, false)
+            .map_err(|_| BorrowError::ReentrancyDetected)?;
+
         initialize_borrow_logic(&env, debt_ceiling, min_borrow_amount)
     }
 
@@ -373,11 +469,21 @@ impl LendingContract {
 
     /// Initialize the insurance pool (admin only, call once).
     pub fn insurance_initialize(env: Env, admin: Address) -> Result<(), InsuranceError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard (constructor protection)
+        let _guard = ReentrancyGuard::new_constructor(&env)
+            .map_err(|_| InsuranceError::Unauthorized)?;
+
         insurance_initialize(&env, &admin)
     }
 
     /// Contribute protocol fees to the insurance pool.
     pub fn insurance_fund_pool(env: Env, amount: i128) -> Result<(), InsuranceError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard
+        let _guard = ReentrancyGuard::new_with_key(&env, ReentrancyKey::GlobalLock, false)
+            .map_err(|_| InsuranceError::Unauthorized)?;
+
         insurance_fund_pool(&env, amount)
     }
 
@@ -389,6 +495,11 @@ impl LendingContract {
         asset: Address,
         coverage_amount: i128,
     ) -> Result<i128, InsuranceError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard
+        let _guard = ReentrancyGuard::new_with_key(&env, ReentrancyKey::GlobalLock, false)
+            .map_err(|_| InsuranceError::Unauthorized)?;
+
         insurance_collect_premium(&env, payer, asset, coverage_amount)
     }
 
@@ -399,6 +510,11 @@ impl LendingContract {
         asset: Address,
         amount: i128,
     ) -> Result<u64, InsuranceError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard
+        let _guard = ReentrancyGuard::new_with_key(&env, ReentrancyKey::GlobalLock, false)
+            .map_err(|_| InsuranceError::Unauthorized)?;
+
         insurance_submit_claim(&env, claimant, asset, amount)
     }
 
@@ -409,6 +525,11 @@ impl LendingContract {
         claim_id: u64,
         approve: bool,
     ) -> Result<(), InsuranceError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard
+        let _guard = ReentrancyGuard::new_with_key(&env, ReentrancyKey::GlobalLock, false)
+            .map_err(|_| InsuranceError::Unauthorized)?;
+
         insurance_evaluate_claim(&env, admin, claim_id, approve)
     }
 
@@ -419,6 +540,11 @@ impl LendingContract {
         asset: Address,
         limit_bps: i128,
     ) -> Result<(), InsuranceError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard
+        let _guard = ReentrancyGuard::new_with_key(&env, ReentrancyKey::GlobalLock, false)
+            .map_err(|_| InsuranceError::Unauthorized)?;
+
         insurance_set_coverage_limit(&env, admin, asset, limit_bps)
     }
 
@@ -448,6 +574,11 @@ impl LendingContract {
         claimant: Address,
         claim_id: u64,
     ) -> Result<(), InsuranceError> {
+        // CHECKS-EFFECTS-INTERACTIONS PATTERN
+        // 1. CHECKS: Reentrancy guard
+        let _guard = ReentrancyGuard::new_with_key(&env, ReentrancyKey::GlobalLock, false)
+            .map_err(|_| InsuranceError::Unauthorized)?;
+
         insurance_cancel_claim(&env, claimant, claim_id)
     }
 
