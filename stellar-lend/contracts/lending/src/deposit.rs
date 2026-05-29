@@ -5,6 +5,7 @@ pub use crate::events::VaultDepositEvent;
 pub type DepositEvent = VaultDepositEvent;
 
 use crate::pause::{self, PauseType};
+use crate::reentrancy::{ReentrancyError, ReentrancyGuard, ReentrancyKey};
 use soroban_sdk::{contracterror, contracttype, Address, Env};
 
 /// Errors that can occur during deposit operations
@@ -18,6 +19,7 @@ pub enum DepositError {
     AssetNotSupported = 4,
     ExceedsDepositCap = 5,
     Unauthorized = 6,
+    ReentrancyDetected = 7,
 }
 
 /// Storage keys for deposit-related data
@@ -66,6 +68,11 @@ pub(crate) fn deposit_with_auth(
     amount: i128,
     require_auth: bool,
 ) -> Result<i128, DepositError> {
+    // CHECKS-EFFECTS-INTERACTIONS PATTERN
+    // 1. CHECKS: Reentrancy guard, authorization, pause state, validation
+    let _guard = ReentrancyGuard::new_with_key(env, ReentrancyKey::DepositLock, false)
+        .map_err(|_| DepositError::ReentrancyDetected)?;
+
     if require_auth {
         user.require_auth();
     }
@@ -93,6 +100,7 @@ pub(crate) fn deposit_with_auth(
         return Err(DepositError::ExceedsDepositCap);
     }
 
+    // 2. EFFECTS: Update state before any external interactions
     let mut position = get_deposit_position(env, &user, &asset);
     position.amount = position
         .amount
@@ -103,6 +111,8 @@ pub(crate) fn deposit_with_auth(
 
     save_deposit_position(env, &user, &position);
     set_total_deposits(env, new_total);
+
+    // 3. INTERACTIONS: Emit events (no external calls in deposit)
     emit_deposit_event(env, user, asset, amount, position.amount);
 
     Ok(position.amount)
