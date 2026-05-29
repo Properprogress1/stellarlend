@@ -16,6 +16,7 @@ pub use crate::events::{BorrowCollateralDepositEvent, BorrowEvent, RepayEvent};
 pub type DepositEvent = BorrowCollateralDepositEvent;
 
 use crate::pause::{self, PauseType};
+use crate::reentrancy::{ReentrancyGuard, ReentrancyKey};
 use soroban_sdk::{contracterror, contracttype, Address, Env, IntoVal, Symbol, I256};
 
 #[contracttype]
@@ -53,6 +54,8 @@ pub enum BorrowError {
     PositionHealthy = 10,
     /// Insufficient reserves to recover bad debt
     InsufficientReserves = 11,
+    /// Reentrancy detected
+    ReentrancyDetected = 12,
 }
 
 /// Borrow on behalf of a user when authorization is provided via a trusted delegate.
@@ -374,6 +377,11 @@ fn borrow_inner(
     rate_type: RateType,
     auth: BorrowAuth,
 ) -> Result<(), BorrowError> {
+    // CHECKS-EFFECTS-INTERACTIONS PATTERN
+    // 1. CHECKS: Reentrancy guard, authorization, pause state, validation
+    let _guard = ReentrancyGuard::new_with_key(env, ReentrancyKey::BorrowLock, false)
+        .map_err(|_| BorrowError::ReentrancyDetected)?;
+
     if auth == BorrowAuth::RequireUserSignature {
         user.require_auth();
     }
@@ -403,6 +411,7 @@ fn borrow_inner(
         return Err(BorrowError::DebtCeilingReached);
     }
 
+    // 2. EFFECTS: Update state before any external interactions
     let mut debt_position = get_debt_position(env, &user, Some(&asset), rate_type);
     debt_position.rate_type = rate_type;
     let accrued_interest = calculate_interest(env, &debt_position)?;
@@ -433,6 +442,7 @@ fn borrow_inner(
     save_collateral_position(env, &user, &collateral_position);
     set_total_debt(env, new_total);
 
+    // 3. INTERACTIONS: External calls (risk_monitor) and events
     crate::risk_monitor::on_utilization_changed(env, new_total, debt_ceiling);
 
     emit_borrow_event(env, user, asset, amount, collateral_amount);
@@ -448,10 +458,16 @@ fn borrow_inner(
 /// * `asset` - The collateral asset
 /// * `amount` - The amount to deposit
 pub fn deposit(env: &Env, user: Address, asset: Address, amount: i128) -> Result<(), BorrowError> {
+    // CHECKS-EFFECTS-INTERACTIONS PATTERN
+    // 1. CHECKS: Reentrancy guard, validation
+    let _guard = ReentrancyGuard::new_with_key(env, ReentrancyKey::DepositCollateralLock, false)
+        .map_err(|_| BorrowError::ReentrancyDetected)?;
+
     if amount <= 0 {
         return Err(BorrowError::InvalidAmount);
     }
 
+    // 2. EFFECTS: Update state before any external interactions
     let mut collateral_position = get_collateral_position(env, &user);
 
     // If it's the first deposit, set the asset
@@ -468,6 +484,7 @@ pub fn deposit(env: &Env, user: Address, asset: Address, amount: i128) -> Result
 
     save_collateral_position(env, &user, &collateral_position);
 
+    // 3. INTERACTIONS: Emit events
     BorrowCollateralDepositEvent {
         user,
         asset,
@@ -502,6 +519,11 @@ pub fn repay_with_rate(
     amount: i128,
     rate_type: RateType,
 ) -> Result<(), BorrowError> {
+    // CHECKS-EFFECTS-INTERACTIONS PATTERN
+    // 1. CHECKS: Reentrancy guard, validation
+    let _guard = ReentrancyGuard::new_with_key(env, ReentrancyKey::RepayLock, false)
+        .map_err(|_| BorrowError::ReentrancyDetected)?;
+
     if amount <= 0 {
         return Err(BorrowError::InvalidAmount);
     }
@@ -517,6 +539,7 @@ pub fn repay_with_rate(
         return Err(BorrowError::AssetNotSupported);
     }
 
+    // 2. EFFECTS: Update state before any external interactions
     // First repay interest, then principal
     let accrued_interest = calculate_interest(env, &debt_position)?;
     debt_position.interest_accrued = debt_position
@@ -553,6 +576,7 @@ pub fn repay_with_rate(
 
     save_debt_position(env, &user, &debt_position);
 
+    // 3. INTERACTIONS: Emit events
     RepayEvent {
         user,
         asset,
@@ -570,6 +594,11 @@ pub fn switch_rate_type(
     asset: Address,
     to_rate_type: RateType,
 ) -> Result<(), BorrowError> {
+    // CHECKS-EFFECTS-INTERACTIONS PATTERN
+    // 1. CHECKS: Reentrancy guard, authorization
+    let _guard = ReentrancyGuard::new_with_key(env, ReentrancyKey::BorrowLock, false)
+        .map_err(|_| BorrowError::ReentrancyDetected)?;
+
     user.require_auth();
 
     let from_rate_type = if to_rate_type == RateType::Variable {
@@ -590,6 +619,7 @@ pub fn switch_rate_type(
         return Err(BorrowError::AssetNotSupported);
     }
 
+    // 2. EFFECTS: Update state before any external interactions
     // Accrue interest on the source position before moving.
     let accrued_interest = calculate_interest(env, &from_position)?;
     from_position.interest_accrued = from_position
@@ -629,6 +659,8 @@ pub fn switch_rate_type(
 
     save_debt_position(env, &user, &from_position);
     save_debt_position(env, &user, &to_position);
+
+    // 3. INTERACTIONS: No external calls, only state updates
 
     Ok(())
 }
