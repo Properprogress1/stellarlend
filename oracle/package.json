@@ -4,7 +4,18 @@
   "description": "Mock price oracle for StellarLend local development",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "vitest",
+    "test:watch": "vitest --watch",
+    "mutation:test": "stryker run",
+    "mutation:check": "stryker run --dryRunOnly"
   },
-  "dependencies": {}
+  "dependencies": {},
+  "devDependencies": {
+    "@stryker-mutator/core": "^8.7.1",
+    "@stryker-mutator/typescript-checker": "^8.7.1",
+    "@stryker-mutator/vitest-runner": "^8.7.1",
+    "typescript": "^5.3.3",
+    "vitest": "^1.0.0"
+  }
 }
