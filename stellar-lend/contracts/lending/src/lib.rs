@@ -9,6 +9,7 @@ mod pause;
 mod token_receiver;
 mod withdraw;
 mod reentrancy;
+mod rounding;
 
 use borrow::{
     borrow as borrow_cmd, deposit as borrow_deposit, get_admin as get_borrow_admin,
@@ -590,5 +591,24 @@ impl LendingContract {
     /// Get all claims (full history).
     pub fn insurance_get_all_claims(env: Env) -> Vec<InsuranceClaim> {
         insurance_get_all_claims(&env)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Dust sweep functions
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Sweep dust amounts from user's deposit position
+    pub fn sweep_deposit_dust(env: Env, user: Address, asset: Address) -> Result<i128, DepositError> {
+        deposit::sweep_dust(&env, user, asset)
+    }
+
+    /// Sweep dust amounts from user's debt position
+    pub fn sweep_borrow_dust(env: Env, user: Address, asset: Address) -> Result<i128, BorrowError> {
+        borrow::sweep_dust(&env, user, asset)
+    }
+
+    /// Sweep dust amounts from user's withdraw position
+    pub fn sweep_withdraw_dust(env: Env, user: Address, asset: Address) -> Result<i128, WithdrawError> {
+        withdraw::sweep_dust(&env, user, asset)
     }
 }
